@@ -22,6 +22,7 @@ export const TIER_LIMITS: Record<Tier, BucketConfig> = {
 
 const IP_LIMIT: BucketConfig = { capacity: 30, refillRate: 0.5 };        // 30/min
 const AUTH_LIMIT: BucketConfig = { capacity: 20, refillRate: 20 / 900 }; // 20/15 min
+const API_KEY_LIMIT: BucketConfig = { capacity: 120, refillRate: 2 };    // 120/min per key
 
 // Atomic token bucket implemented as a Lua script to eliminate race conditions.
 // KEYS[1] — Redis hash key for this bucket
@@ -132,6 +133,8 @@ export function ipRateLimiter(
 // Per-user tiered limiter. Must run after the authenticate middleware sets req.user.
 export function userRateLimiter(): RequestHandler {
   return async (req: Request, res: Response, next: NextFunction): Promise<void> => {
+    // API keys are limited by their own identity bucket in apiKeyAuthentication.
+    if ((req as any).apiKey) { next(); return; }
     const user = (req as any).user as { sub: string; tier?: Tier } | undefined;
     if (!user) { next(); return; }
 
@@ -149,6 +152,28 @@ export function userRateLimiter(): RequestHandler {
           tier,
           retryAfter: result.retryAfter,
         });
+        return;
+      }
+      next();
+    } catch (err) {
+      console.error("[RateLimit] Redis error:", (err as Error).message);
+      next();
+    }
+  };
+}
+
+// Per-key token bucket. It is independent of the shared IP and JWT user buckets.
+export function apiKeyRateLimiter(): RequestHandler {
+  return async (req: Request, res: Response, next: NextFunction): Promise<void> => {
+    const identity = (req as any).apiKey as { id: string } | undefined;
+    if (!identity) { next(); return; }
+
+    try {
+      const result = await consumeToken(`rl:api-key:${identity.id}`, API_KEY_LIMIT);
+      applyHeaders(res, result, API_KEY_LIMIT);
+      if (!result.allowed) {
+        res.set("Retry-After", String(result.retryAfter));
+        res.status(429).json({ error: "API key rate limit exceeded", retryAfter: result.retryAfter });
         return;
       }
       next();

@@ -1,6 +1,8 @@
 import cors from "cors";
 import express from "express";
 import { authenticate } from "./middleware/authMiddleware.js";
+import { authenticateAdminJwt } from "./middleware/adminJwtMiddleware.js";
+import { apiKeyAuthentication, requireApiKeyScope } from "./middleware/apiKeyMiddleware.js";
 import {
   authRateLimiter,
   globalIpRateLimiter,
@@ -25,6 +27,8 @@ import { queueRouter } from "./routes/queueRoutes.js";
 import { warmCache } from "./services/defi.js";
 import { startEmailWorker, stopEmailWorker } from "./services/emailQueue.js";
 import { startYieldWorker, stopYieldWorker } from "./services/yieldWorker.js";
+import { apiKeyAdminRouter } from "./routes/apiKeyAdminRoutes.js";
+import { closeDbPool } from "./db.js";
 
 const app = express();
 app.use(cors());
@@ -59,6 +63,8 @@ app.post("/api/auth/refresh", authRateLimiter(), async (req, res) => {
   res.json(tokens);
 });
 
+app.use("/api/admin/api-keys", authenticateAdminJwt, apiKeyAdminRouter);
+
 app.post("/api/auth/logout", authenticate, userRateLimiter(), async (req, res) => {
   const token = req.headers.authorization?.slice(7);
   if (!token) {
@@ -83,7 +89,7 @@ app.post("/api/auth/revoke-all", authenticate, userRateLimiter(), async (req, re
 
 app.use("/api/webhooks", authenticate, webhookRouter);
 app.use("/api/email", emailRouter);
-app.use("/api/v1/user/portfolio", authenticate, portfolioRouter);
+app.use("/api/v1/user/portfolio", apiKeyAuthentication, requireApiKeyScope("read"), authenticate, portfolioRouter);
 app.use("/api/v1/gas", gasRouter);
 app.use("/api/v1/yield", yieldRouter);
 app.use("/api/v1/queue", queueRouter);
@@ -114,6 +120,9 @@ async function shutdown(signal: string): Promise<void> {
   server.close(async () => {
     await disconnectRedis().catch((err) => {
       console.error("[shutdown] redis disconnect failed:", err);
+    });
+    await closeDbPool().catch((err) => {
+      console.error("[shutdown] PostgreSQL pool disconnect failed:", err);
     });
     process.exit(0);
   });

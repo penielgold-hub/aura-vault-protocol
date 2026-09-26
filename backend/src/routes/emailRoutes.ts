@@ -2,6 +2,7 @@ import { Router, Request, Response } from 'express';
 import crypto from 'crypto';
 import { authenticate } from '../middleware/authMiddleware.js';
 import { userRateLimiter } from '../middleware/rateLimitMiddleware.js';
+import { apiKeyAuthentication, requireApiKeyScope } from '../middleware/apiKeyMiddleware.js';
 import {
   parseUnsubscribeToken,
   recordUnsubscribe,
@@ -22,7 +23,7 @@ export const emailRouter = Router();
  * POST /api/email/send
  * Enqueue a single transactional email. Requires authentication.
  */
-emailRouter.post('/send', authenticate, userRateLimiter(), async (req: Request, res: Response): Promise<void> => {
+emailRouter.post('/send', apiKeyAuthentication, requireApiKeyScope('write'), authenticate, userRateLimiter(), async (req: Request, res: Response): Promise<void> => {
   const { to, template, data, subject, priority, attachments, maxAttempts } = req.body;
 
   if (!to || !template) {
@@ -42,7 +43,7 @@ emailRouter.post('/send', authenticate, userRateLimiter(), async (req: Request, 
  * POST /api/email/send/bulk
  * Enqueue multiple emails in one call. Requires authentication.
  */
-emailRouter.post('/send/bulk', authenticate, userRateLimiter(), async (req: Request, res: Response): Promise<void> => {
+emailRouter.post('/send/bulk', apiKeyAuthentication, requireApiKeyScope('write'), authenticate, userRateLimiter(), async (req: Request, res: Response): Promise<void> => {
   const { jobs } = req.body;
 
   if (!Array.isArray(jobs) || jobs.length === 0) {
@@ -247,7 +248,7 @@ emailRouter.get('/track/click/:trackingId', async (req: Request, res: Response):
  * GET /api/email/stats
  * Queue depth and delivery stats. Requires authentication.
  */
-emailRouter.get('/stats', authenticate, async (_req: Request, res: Response): Promise<void> => {
+emailRouter.get('/stats', apiKeyAuthentication, requireApiKeyScope('read'), authenticate, async (_req: Request, res: Response): Promise<void> => {
   const stats = await getQueueStats();
   res.json({ queue: stats });
 });
@@ -256,7 +257,7 @@ emailRouter.get('/stats', authenticate, async (_req: Request, res: Response): Pr
  * GET /api/email/track/:trackingId/events
  * Retrieve tracking events for a specific email. Requires authentication.
  */
-emailRouter.get('/track/:trackingId/events', authenticate, async (req: Request, res: Response): Promise<void> => {
+emailRouter.get('/track/:trackingId/events', apiKeyAuthentication, requireApiKeyScope('read'), authenticate, async (req: Request, res: Response): Promise<void> => {
   const events = await getTrackingEvents(String(req.params['trackingId']));
   res.json({ events });
 });
@@ -265,7 +266,7 @@ emailRouter.get('/track/:trackingId/events', authenticate, async (req: Request, 
  * GET /api/email/dns?domain=auravault.io&selector=s1
  * Verify DKIM/SPF/DMARC DNS records for the sending domain.
  */
-emailRouter.get('/dns', authenticate, async (req: Request, res: Response): Promise<void> => {
+emailRouter.get('/dns', apiKeyAuthentication, requireApiKeyScope('read'), authenticate, async (req: Request, res: Response): Promise<void> => {
   const domain   = String(req.query.domain ?? process.env.MAILGUN_DOMAIN ?? '');
   const selector = String(req.query.selector ?? 's1');
 
