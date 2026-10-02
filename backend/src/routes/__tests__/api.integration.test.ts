@@ -13,7 +13,7 @@ import request from "supertest";
 // ─── Mock Redis before any imports that touch it ─────────────────────────────
 // Fake Redis client — returns "allowed" from the token-bucket Lua script
 const fakeRedisClient = {
-  eval: vi.fn().mockResolvedValue([1, 59, 60, 0]), // [allowed, remaining, limit, retryAfter]
+  eval: vi.fn().mockImplementation(async (_script, _keys, _key, capacity) => [1, capacity - 1, capacity, 0]), // [allowed, remaining, limit, retryAfter]
   ping: vi.fn().mockResolvedValue("PONG"),
   on: vi.fn(),
   quit: vi.fn().mockResolvedValue(undefined),

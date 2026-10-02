@@ -1,5 +1,6 @@
 import { Request, Response, NextFunction, RequestHandler } from "express";
 import { getRedis } from "../redis.js";
+import { rateLimit, type Store, type RateLimitInfo } from "express-rate-limit";
 
 export type Tier = "free" | "paid";
 
@@ -130,36 +131,67 @@ export function ipRateLimiter(
   };
 }
 
-// Per-user tiered limiter. Must run after the authenticate middleware sets req.user.
-export function userRateLimiter(): RequestHandler {
-  return async (req: Request, res: Response, next: NextFunction): Promise<void> => {
-    // API keys are limited by their own identity bucket in apiKeyAuthentication.
-    if ((req as any).apiKey) { next(); return; }
-    const user = (req as any).user as { sub: string; tier?: Tier } | undefined;
-    if (!user) { next(); return; }
-
-    const tier = user.tier ?? "free";
-    const config = TIER_LIMITS[tier] ?? TIER_LIMITS.free;
-    const redisKey = `rl:user:${user.sub}`;
-
-    try {
+// Expose the existing Redis token buckets through a middleware package modeled by
+// CodeQL. The store consumes exactly one token; express-rate-limit adds no bucket.
+function redisTokenBucketLimiter(
+  bucket: (req: Request) => { redisKey: string; config: BucketConfig },
+  skip: (req: Request) => boolean,
+  error: (req: Request) => Record<string, unknown>
+): RequestHandler {
+  const store: Store = {
+    async increment(key) {
+      const { redisKey, config } = JSON.parse(key) as ReturnType<typeof bucket>;
       const result = await consumeToken(redisKey, config);
-      applyHeaders(res, result, config);
-      if (!result.allowed) {
-        res.set("Retry-After", String(result.retryAfter));
-        res.status(429).json({
-          error: "Rate limit exceeded",
-          tier,
-          retryAfter: result.retryAfter,
-        });
-        return;
-      }
-      next();
-    } catch (err) {
-      console.error("[RateLimit] Redis error:", (err as Error).message);
-      next();
-    }
+      // Translate available tokens into the hit-count API without using a fixed
+      // window counter. An exhausted bucket must exceed the configured limit.
+      return {
+        totalHits: result.allowed ? config.capacity - result.remaining : config.capacity + 1,
+        resetTime: new Date((result.allowed ? Math.floor(Date.now() / 1000) * 1000 : Date.now()) + 1000 * (result.allowed
+          ? Math.ceil((config.capacity - result.remaining) / config.refillRate)
+          : result.retryAfter)),
+      };
+    },
+    decrement() {
+      // Neither successful nor failed requests refund tokens.
+      throw new Error("Token-bucket refunds are not supported");
+    },
+    async resetKey(key) {
+      const { redisKey } = JSON.parse(key) as ReturnType<typeof bucket>;
+      await getRedis().del(redisKey);
+    },
   };
+  return rateLimit({
+    store,
+    keyGenerator: (req) => JSON.stringify(bucket(req)),
+    limit: (req) => bucket(req).config.capacity,
+    skip,
+    passOnStoreError: true,
+    standardHeaders: false,
+    legacyHeaders: true,
+    handler: (req, res) => {
+      const { config } = bucket(req);
+      const resetTime = (req as Request & { rateLimit: RateLimitInfo }).rateLimit.resetTime!;
+      const retryAfter = Math.max(1, Math.ceil((resetTime.getTime() - Date.now()) / 1000));
+      // Preserve the token-bucket full-refill reset header on denied requests.
+      res.set("X-RateLimit-Reset", String(Math.floor(Date.now() / 1000) + Math.ceil(config.capacity / config.refillRate)));
+      res.set("Retry-After", String(retryAfter));
+      res.status(429).json({ ...error(req), retryAfter });
+    },
+  });
+}
+
+// Per-user tiered limiter. Must run after authenticate sets req.user.
+export function userRateLimiter(): RequestHandler {
+  return redisTokenBucketLimiter(
+    (req) => {
+      const user = (req as any).user as { sub: string; tier?: Tier };
+      const tier = user.tier ?? "free";
+      return { redisKey: `rl:user:${user.sub}`, config: TIER_LIMITS[tier] ?? TIER_LIMITS.free };
+    },
+    // apiKeyAuthentication already consumes the independent per-key bucket.
+    (req) => Boolean(req.apiKey) || !(req as any).user,
+    (req) => ({ error: "Rate limit exceeded", tier: (req as any).user.tier ?? "free" })
+  );
 }
 
 // Per-key token bucket. It is independent of the shared IP and JWT user buckets.
@@ -186,7 +218,11 @@ export function apiKeyRateLimiter(): RequestHandler {
 
 // Tight IP-based limiter for auth endpoints (20 req / 15 min).
 export function authRateLimiter(): RequestHandler {
-  return ipRateLimiter(AUTH_LIMIT, "rl:auth:ip");
+  return redisTokenBucketLimiter(
+    (req) => ({ redisKey: `rl:auth:ip:${clientIp(req)}`, config: AUTH_LIMIT }),
+    () => false,
+    () => ({ error: "Too many requests" })
+  );
 }
 
 // Global IP limiter suitable for use as app.use(), with an optional path exclusion list.

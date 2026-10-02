@@ -54,7 +54,7 @@ beforeEach(() => {
   vi.stubEnv("ADMIN_JWT_SECRET", ADMIN_SECRET);
   vi.stubEnv("JWT_SECRET", "ordinary-jwt-secret-is-different");
   vi.mocked(validateAccessToken).mockReset().mockResolvedValue(null);
-  evalScript.mockReset().mockResolvedValue([1, 119, 120, 0]);
+  evalScript.mockReset().mockImplementation(async (_script, _keys, _key, capacity) => [1, capacity - 1, capacity, 0]);
   vi.mocked(findApiKey).mockReset();
   vi.mocked(recordApiKeyAudit).mockClear();
   vi.mocked(createApiKey).mockReset();
@@ -170,6 +170,38 @@ describe("API-key and admin JWT middleware", () => {
     expect(evalScript.mock.calls.map((call) => call[2])).toEqual(["rl:api-key:key-1"]);
     expect(validateAccessToken).not.toHaveBeenCalled();
     expect(recordApiKeyAudit).toHaveBeenCalledWith(expect.objectContaining({ event: "api_key.access", statusCode: 429 }));
+  });
+
+  it("preserves JWT tier buckets, rate headers, and token refill decisions", async () => {
+    vi.mocked(validateAccessToken).mockResolvedValue({ sub: "jwt-user", sessionId: "s", tier: "paid" });
+    evalScript.mockResolvedValueOnce([1, 599, 600, 0])
+      .mockResolvedValueOnce([0, 0, 600, 1])
+      .mockResolvedValueOnce([1, 599, 600, 0]);
+    const app = appForKeys();
+    const allowed = await request(app).get("/read").set("Authorization", "Bearer valid").expect(200);
+    expect(allowed.headers["x-ratelimit-limit"]).toBe("600");
+    expect(allowed.headers["x-ratelimit-remaining"]).toBe("599");
+    const denied = await request(app).get("/read").set("Authorization", "Bearer valid").expect(429);
+    expect(denied.body).toEqual({ error: "Rate limit exceeded", tier: "paid", retryAfter: 1 });
+    expect(denied.headers["retry-after"]).toBe("1");
+    await request(app).get("/read").set("Authorization", "Bearer valid").expect(200);
+    expect(evalScript.mock.calls.map((call) => call[2])).toEqual(Array(3).fill("rl:user:jwt-user"));
+    expect(evalScript.mock.calls[0].slice(3, 5)).toEqual([600, 10]);
+  });
+
+  it("preserves fail-open behavior when Redis is unavailable", async () => {
+    const log = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      evalScript.mockRejectedValue(new Error("Redis unavailable"));
+      vi.mocked(validateAccessToken).mockResolvedValue({ sub: "jwt-user", sessionId: "s" });
+      await request(appForKeys()).get("/read").set("Authorization", "Bearer valid").expect(200);
+      vi.mocked(createApiKey).mockResolvedValue({ id: "key-1", apiKey: RAW_KEY, scope: "read", expiresAt: null });
+      await request(appForKeys()).post("/api/admin/api-keys")
+        .set("Authorization", `Bearer ${adminToken()}`).send({ scope: "read" }).expect(201);
+      expect(evalScript.mock.calls).toHaveLength(2);
+    } finally {
+      log.mockRestore();
+    }
   });
 
   it("enforces read, write, and admin scopes", async () => {
