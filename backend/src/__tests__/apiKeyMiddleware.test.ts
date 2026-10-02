@@ -1,12 +1,11 @@
 import express from "express";
-import jwt from "jsonwebtoken";
+import jwt, { type SignOptions } from "jsonwebtoken";
 import request from "supertest";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("../auth.js", () => ({ validateAccessToken: vi.fn() }));
-vi.mock("../middleware/rateLimitMiddleware.js", () => ({
-  apiKeyRateLimiter: () => (_req: unknown, _res: unknown, next: () => void) => next(),
-}));
+const { evalScript } = vi.hoisted(() => ({ evalScript: vi.fn() }));
+vi.mock("../redis.js", () => ({ getRedis: () => ({ eval: evalScript }) }));
 vi.mock("../services/apiKeyService.js", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../services/apiKeyService.js")>();
   return {
@@ -20,6 +19,7 @@ vi.mock("../services/apiKeyService.js", async (importOriginal) => {
 
 import { validateAccessToken } from "../auth.js";
 import { apiKeyAuthentication, requireApiKeyScope } from "../middleware/apiKeyMiddleware.js";
+import { authRateLimiter, userRateLimiter } from "../middleware/rateLimitMiddleware.js";
 import { authenticateAdminJwt } from "../middleware/adminJwtMiddleware.js";
 import { authenticate } from "../middleware/authMiddleware.js";
 import { apiKeyAdminRouter } from "../routes/apiKeyAdminRoutes.js";
@@ -31,20 +31,20 @@ const RAW_KEY = `avk_123e4567-e89b-42d3-a456-426614174000.${"a".repeat(64)}`;
 function appForKeys() {
   const app = express();
   app.use(express.json());
-  app.use("/api/admin/api-keys", authenticateAdminJwt, apiKeyAdminRouter);
-  app.get("/read", apiKeyAuthentication, requireApiKeyScope("read"), authenticate, (req, res) => {
+  app.use("/api/admin/api-keys", authRateLimiter(), authenticateAdminJwt, apiKeyAdminRouter);
+  app.get("/read", apiKeyAuthentication, requireApiKeyScope("read"), authenticate, userRateLimiter(), (req, res) => {
     res.json({ owner: (req as any).user.sub });
   });
-  app.post("/write", apiKeyAuthentication, requireApiKeyScope("write"), authenticate, (_req, res) => {
+  app.post("/write", apiKeyAuthentication, requireApiKeyScope("write"), authenticate, userRateLimiter(), (_req, res) => {
     res.json({ ok: true });
   });
-  app.get("/admin-scope", apiKeyAuthentication, requireApiKeyScope("admin"), authenticate, (_req, res) => {
+  app.get("/admin-scope", apiKeyAuthentication, requireApiKeyScope("admin"), authenticate, userRateLimiter(), (_req, res) => {
     res.json({ ok: true });
   });
   return app;
 }
 
-function adminToken(expiresIn = "10m") {
+function adminToken(expiresIn: SignOptions["expiresIn"] = "10m") {
   return jwt.sign({ sub: "operator-1", scope: "admin" }, ADMIN_SECRET, {
     algorithm: "HS256", issuer: "aura-vault-admin", audience: "aura-vault-admin", expiresIn,
   });
@@ -53,7 +53,8 @@ function adminToken(expiresIn = "10m") {
 beforeEach(() => {
   vi.stubEnv("ADMIN_JWT_SECRET", ADMIN_SECRET);
   vi.stubEnv("JWT_SECRET", "ordinary-jwt-secret-is-different");
-  vi.mocked(validateAccessToken).mockReset();
+  vi.mocked(validateAccessToken).mockReset().mockResolvedValue(null);
+  evalScript.mockReset().mockResolvedValue([1, 119, 120, 0]);
   vi.mocked(findApiKey).mockReset();
   vi.mocked(recordApiKeyAudit).mockClear();
   vi.mocked(createApiKey).mockReset();
@@ -123,6 +124,7 @@ describe("API-key and admin JWT middleware", () => {
       .set("Authorization", "Bearer invalid").expect(200);
     expect(res.body.owner).toBe("owner-1");
     expect(validateAccessToken).not.toHaveBeenCalled();
+    expect(evalScript.mock.calls.map((call) => call[2])).toEqual(["rl:api-key:key-1"]);
     await new Promise((resolve) => setTimeout(resolve, 0));
     expect(recordApiKeyAudit).toHaveBeenCalledWith(expect.objectContaining({ event: "api_key.access", apiKeyId: "key-1" }));
     expect(JSON.stringify(vi.mocked(recordApiKeyAudit).mock.calls)).not.toContain(RAW_KEY);
@@ -146,6 +148,28 @@ describe("API-key and admin JWT middleware", () => {
     const res = await request(appForKeys()).get("/read").set("Authorization", "Bearer valid-user-token").expect(200);
     expect(res.body.owner).toBe("jwt-user");
     expect(findApiKey).not.toHaveBeenCalled();
+    expect(evalScript.mock.calls.map((call) => call[2])).toEqual(["rl:user:jwt-user"]);
+  });
+
+  it("rate-limits admin requests before JWT validation or key creation", async () => {
+    evalScript.mockResolvedValue([0, 0, 20, 45]);
+    const response = await request(appForKeys()).post("/api/admin/api-keys")
+      .set("Authorization", `Bearer ${adminToken()}`).send({ scope: "read" }).expect(429);
+    expect(response.headers["retry-after"]).toBe("45");
+    expect(evalScript.mock.calls).toHaveLength(1);
+    expect(evalScript.mock.calls[0][2]).toMatch(/^rl:auth:ip:/);
+    expect(createApiKey).not.toHaveBeenCalled();
+    expect(validateAccessToken).not.toHaveBeenCalled();
+  });
+
+  it("rejects an exhausted API-key bucket without consuming a user bucket", async () => {
+    vi.mocked(findApiKey).mockResolvedValue({ state: "active", identity: { id: "key-1", owner: "owner-1", scope: "read" } });
+    evalScript.mockResolvedValue([0, 0, 120, 1]);
+    const response = await request(appForKeys()).get("/read").set("X-API-Key", RAW_KEY).expect(429);
+    expect(response.headers["retry-after"]).toBe("1");
+    expect(evalScript.mock.calls.map((call) => call[2])).toEqual(["rl:api-key:key-1"]);
+    expect(validateAccessToken).not.toHaveBeenCalled();
+    expect(recordApiKeyAudit).toHaveBeenCalledWith(expect.objectContaining({ event: "api_key.access", statusCode: 429 }));
   });
 
   it("enforces read, write, and admin scopes", async () => {

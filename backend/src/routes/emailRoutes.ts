@@ -266,7 +266,7 @@ emailRouter.get('/track/:trackingId/events', apiKeyAuthentication, requireApiKey
  * GET /api/email/dns?domain=auravault.io&selector=s1
  * Verify DKIM/SPF/DMARC DNS records for the sending domain.
  */
-emailRouter.get('/dns', apiKeyAuthentication, requireApiKeyScope('read'), authenticate, async (req: Request, res: Response): Promise<void> => {
+emailRouter.get('/dns', apiKeyAuthentication, requireApiKeyScope('read'), authenticate, userRateLimiter(), async (req: Request, res: Response): Promise<void> => {
   const domain   = String(req.query.domain ?? process.env.MAILGUN_DOMAIN ?? '');
   const selector = String(req.query.selector ?? 's1');
 

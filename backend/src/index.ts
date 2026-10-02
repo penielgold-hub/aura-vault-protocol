@@ -63,7 +63,7 @@ app.post("/api/auth/refresh", authRateLimiter(), async (req, res) => {
   res.json(tokens);
 });
 
-app.use("/api/admin/api-keys", authenticateAdminJwt, apiKeyAdminRouter);
+app.use("/api/admin/api-keys", authRateLimiter(), authenticateAdminJwt, apiKeyAdminRouter);
 
 app.post("/api/auth/logout", authenticate, userRateLimiter(), async (req, res) => {
   const token = req.headers.authorization?.slice(7);
